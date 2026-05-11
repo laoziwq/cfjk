@@ -9,7 +9,7 @@ export default {
 };
 
 // ================= 默认配置 =================
-const DEFAULT_LOGIN_PASSWORD = "Lichunfeng..3";
+// 注意：LOGIN_PASSWORD 必须通过环境变量设置，无默认值
 const DEFAULT_GITHUB_URL = "https://github.com/";
 const DEFAULT_BLOG_URL = "";
 const DEFAULT_MONITOR_NAME = "站点监测控制台";
@@ -17,22 +17,31 @@ const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 const KV_KEY_SITES = "config_list_v1";
 const KV_KEY_HISTORY = "status_history_v1";
+const KV_KEY_RATE_LIMIT = "rate_limit_v1";
+const KV_KEY_LAST_ALERT = "last_alert_v1";
 
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_SECONDS = 300; // 5分钟
 const PROBE_TIMEOUT_MS = 3000;
-const PROBE_BATCH_SIZE = 5;
+const PROBE_BATCH_SIZE = 10;
 const MAX_HISTORY_POINTS = 30;
+const ALERT_COOLDOWN_MS = 10 * 60 * 1000; // 同一站点告警冷却 10 分钟
 
 // 默认站点列表（仅当 KV 为空时使用一次）
 const DEFAULT_SITES = [
   { url: "https://www.baidu.com", name: "百度" },
-  { url: "https://googel.com", name: "谷歌" },
+  { url: "https://www.google.com", name: "谷歌" },
 ];
 
 // ================= 工具函数 =================
 
 function getRuntimeConfig(env) {
+  const password = env.LOGIN_PASSWORD;
+  if (!password || typeof password !== "string" || !password.trim()) {
+    throw new Error("LOGIN_PASSWORD 环境变量未设置，请先在 Cloudflare Workers 设置中配置登录密码");
+  }
   return {
-    loginPassword: String(env.LOGIN_PASSWORD || DEFAULT_LOGIN_PASSWORD),
+    loginPassword: password.trim(),
     githubUrl: String(env.GITHUB_URL || DEFAULT_GITHUB_URL),
     blogUrl: String(env.BLOG_URL || DEFAULT_BLOG_URL),
     monitorName: String(env.MONITOR_NAME || DEFAULT_MONITOR_NAME),
@@ -56,6 +65,60 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
       ...extraHeaders,
     },
   });
+}
+
+// ================= 登录限流 =================
+async function checkRateLimit(env, clientIp) {
+  if (!hasStatusKV(env)) return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS };
+  const key = `${KV_KEY_RATE_LIMIT}:${clientIp}`;
+  try {
+    const raw = await env.STATUS.get(key);
+    if (!raw) return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS };
+    const record = JSON.parse(raw);
+    const now = Date.now();
+    if (now - record.ts < LOGIN_LOCKOUT_SECONDS * 1000) {
+      if (record.attempts >= LOGIN_MAX_ATTEMPTS) {
+        const waitSec = Math.ceil((LOGIN_LOCKOUT_SECONDS * 1000 - (now - record.ts)) / 1000);
+        return { allowed: false, remaining: 0, waitSec };
+      }
+      return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS - record.attempts };
+    }
+    return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS };
+  } catch {
+    return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS };
+  }
+}
+
+async function recordFailedLogin(env, clientIp) {
+  if (!hasStatusKV(env)) return;
+  const key = `${KV_KEY_RATE_LIMIT}:${clientIp}`;
+  try {
+    const raw = await env.STATUS.get(key);
+    let record = { attempts: 0, ts: Date.now() };
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Date.now() - parsed.ts < LOGIN_LOCKOUT_SECONDS * 1000) {
+        record = { attempts: parsed.attempts + 1, ts: parsed.ts };
+      }
+    } else {
+      record = { attempts: 1, ts: Date.now() };
+    }
+    await env.STATUS.put(key, JSON.stringify(record));
+  } catch { /* ignore */ }
+}
+
+async function clearRateLimit(env, clientIp) {
+  if (!hasStatusKV(env)) return;
+  const key = `${KV_KEY_RATE_LIMIT}:${clientIp}`;
+  try {
+    await env.STATUS.delete(key);
+  } catch { /* ignore */ }
+}
+
+function getClientIp(request) {
+  return request.headers.get("CF-Connecting-IP")
+    || request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim()
+    || "unknown";
 }
 
 function htmlResponse(html) {
@@ -363,26 +426,105 @@ async function getStatusResults(env) {
 
   cleanupHistory(nextHistoryMap, sites);
   await saveHistoryMap(env, nextHistoryMap);
+  await checkAndAlert(env, results, historyMap);
 
   return results;
+}
+
+// ================= Webhook 告警 =================
+async function sendWebhookAlert(env, site, isUp) {
+  const webhookUrl = env.WEBHOOK_URL;
+  if (!webhookUrl || typeof webhookUrl !== "string") return;
+
+  const key = `${KV_KEY_LAST_ALERT}:${site.url}`;
+  const now = Date.now();
+
+  try {
+    const lastAlert = await env.STATUS.get(key);
+    if (lastAlert) {
+      const { ts } = JSON.parse(lastAlert);
+      if (now - ts < ALERT_COOLDOWN_MS) return; // 冷却期内不重复告警
+    }
+  } catch { /* ignore */ }
+
+  try {
+    const payload = {
+      event: isUp ? "site_recovered" : "site_down",
+      site: { name: site.name, url: site.url },
+      timestamp: new Date().toISOString(),
+      message: isUp
+        ? `✅ 站点已恢复：${site.name} (${site.url})`
+        : `❌ 站点离线：${site.name} (${site.url})`,
+    };
+
+    const webhookTarget = new URL(webhookUrl);
+    await fetchWithTimeout(
+      webhookUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "CF-SiteMonitor/1.2",
+        },
+        body: JSON.stringify(payload),
+      },
+      5000
+    );
+
+    await env.STATUS.put(key, JSON.stringify({ ts: now }));
+  } catch (error) {
+    console.error("Webhook alert failed:", error);
+  }
+}
+
+async function checkAndAlert(env, results, prevHistoryMap) {
+  const webhookUrl = env.WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  for (const result of results) {
+    const prev = prevHistoryMap[result.url];
+    const wasUp = prev && prev.length > 0 && prev[prev.length - 1] === 1;
+    if (wasUp === false && result.isUp === true) {
+      await sendWebhookAlert(env, result, true);
+    } else if (wasUp === true && result.isUp === false) {
+      await sendWebhookAlert(env, result, false);
+    }
+  }
 }
 
 // ================= 主请求处理 =================
 
 async function handleRequest(request, env, ctx) {
+  let config;
+  try {
+    config = getRuntimeConfig(env);
+  } catch (err) {
+    return htmlResponse(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;color:#333">
+      <h2 style="color:#dc2626">配置错误</h2>
+      <p>${escapeHtml(err.message)}</p>
+    </body></html>`, 500);
+  }
+
   const url = new URL(request.url);
   const path = url.pathname;
-  const config = getRuntimeConfig(env);
 
   // 1) 登录
   if (path === "/api/login" && request.method === "POST") {
+    const clientIp = getClientIp(request);
+    const rateLimit = await checkRateLimit(env, clientIp);
+    if (!rateLimit.allowed) {
+      return errorResponse(`登录过于频繁，请 ${rateLimit.waitSec} 秒后重试`, 429);
+    }
+
     const body = await readJsonBody(request);
     if (!body || typeof body.password !== "string") {
       return errorResponse("请求体格式错误", 400);
     }
     if (body.password !== config.loginPassword) {
-      return errorResponse("密码错误", 401);
+      await recordFailedLogin(env, clientIp);
+      return errorResponse(`密码错误，还剩 ${rateLimit.remaining - 1} 次尝试机会`, 401);
     }
+    await clearRateLimit(env, clientIp);
     return jsonResponse(
       { success: true },
       200,
@@ -466,6 +608,75 @@ async function handleRequest(request, env, ctx) {
     return jsonResponse({ success: true });
   }
 
+  // 6.5) API: 编辑站点
+  if (path === "/api/edit-site" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (!body) return errorResponse("请求体格式错误", 400);
+
+    const oldUrl = normalizeSiteUrl(body.oldUrl);
+    if (!oldUrl) return errorResponse("原 URL 无效", 400);
+
+    if (typeof body.newName !== "string" || !body.newName.trim()) {
+      return errorResponse("站点名称不能为空", 400);
+    }
+    const newName = body.newName.trim().slice(0, 80);
+
+    let newUrl = oldUrl;
+    if (body.newUrl && typeof body.newUrl === "string") {
+      const normalized = normalizeSiteUrl(body.newUrl);
+      if (!normalized) return errorResponse("新 URL 无效，仅支持 http/https", 400);
+      newUrl = normalized;
+    }
+
+    const currentSites = await getSites(env);
+    const siteIndex = currentSites.findIndex((site) => site.url === oldUrl);
+    if (siteIndex === -1) return errorResponse("站点不存在", 404);
+
+    // 如果 URL 变了，检查新 URL 是否已被占用
+    if (newUrl !== oldUrl && currentSites.some((s) => s.url === newUrl)) {
+      return errorResponse("站点 URL 已存在", 409);
+    }
+
+    const oldSite = currentSites[siteIndex];
+    currentSites[siteIndex] = { name: newName, url: newUrl };
+    const ok = await saveSites(env, currentSites);
+    if (!ok) return errorResponse("保存站点失败", 500);
+
+    // 处理 URL 变更：迁移历史记录
+    const historyMap = await getHistoryMap(env);
+    if (newUrl !== oldUrl) {
+      if (historyMap[oldUrl]) {
+        historyMap[newUrl] = historyMap[oldUrl];
+        delete historyMap[oldUrl];
+        await saveHistoryMap(env, historyMap);
+      }
+    } else {
+      await saveHistoryMap(env, historyMap);
+    }
+
+    return jsonResponse({ success: true, site: { name: newName, url: newUrl } });
+  }
+
+  // 6.6) API: 拖拽排序保存
+  if (path === "/api/reorder-sites" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    if (!body || !Array.isArray(body.sites)) {
+      return errorResponse("请求体格式错误", 400);
+    }
+    const normalized = sanitizeSites(body.sites);
+    // 校验提交的 URL 必须全部属于已有站点，防止注入
+    const currentSites = await getSites(env);
+    const currentUrls = new Set(currentSites.map((s) => s.url));
+    for (const s of normalized) {
+      if (!currentUrls.has(s.url)) {
+        return errorResponse(`站点 ${s.url} 不存在`, 400);
+      }
+    }
+    const ok = await saveSites(env, normalized);
+    if (!ok) return errorResponse("保存排序失败", 500);
+    return jsonResponse({ success: true });
+  }
+
   // 7) API: 获取状态
   if (path === "/api/status" && request.method === "GET") {
     try {
@@ -477,7 +688,26 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 8) 页面资源
+  // 8) API: 健康检查（无需认证）
+  if (path === "/api/health" && request.method === "GET") {
+    const kvOk = hasStatusKV(env);
+    let sitesCount = 0;
+    if (kvOk) {
+      try {
+        const sites = await getSites(env);
+        sitesCount = sites.length;
+      } catch { /* ignore */ }
+    }
+    return jsonResponse({
+      success: true,
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      kv_bound: kvOk,
+      sites_count: sitesCount,
+    });
+  }
+
+  // 9) 页面资源
   if (path === "/script.js") {
     return textResponse(
       getScript(config.refreshIntervalMs),
@@ -584,6 +814,7 @@ function getIndexHTML(config) {
         <a href="${safeGitHub}" target="_blank" class="button github-button"><i class="fab fa-github"></i> GitHub</a>
         ${blogButton}
         <button id="manageBtn" class="button manage-button"><i class="fas fa-cog"></i> 管理</button>
+        <button id="darkModeBtn" class="button" style="background:#374151;padding:8px 10px" title="切换深色模式"><i class="fas fa-moon"></i></button>
       </div>
     </div>
 
@@ -593,6 +824,7 @@ function getIndexHTML(config) {
         <input type="text" id="newSiteName" placeholder="站点名称（如：我的站点）">
         <input type="text" id="newSiteUrl" placeholder="站点 URL（如：https://example.com）">
         <button id="addSiteBtn">添加</button>
+        <button id="deleteAllBtn" style="background:#dc2626;margin-left:auto">清空全部</button>
       </div>
     </div>
 
@@ -625,6 +857,8 @@ function getStyle() {
 .add-form input{flex:1;min-width:220px;padding:9px;border:1px solid #d1d5db;border-radius:8px}
 .add-form button{background:#16a34a;color:#fff;padding:9px 16px;border-radius:8px;border:none;cursor:pointer;font-weight:700}
 .add-form button:hover{background:#15803d}
+.edit-btn{color:#2563eb;background:rgba(37,99,235,.1);width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .2s;margin-left:4px;border:none;flex-shrink:0}
+.edit-btn:hover{background:#2563eb;color:#fff}
 
 .status-summary{background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-bottom:12px;color:#334155;font-size:13px}
 .status-item{position:relative;display:flex;flex-direction:row;align-items:center;background:#fff;margin-bottom:12px;padding:14px;border-radius:10px;border-left:4px solid transparent;box-shadow:0 3px 10px rgba(15,23,42,.04);transition:transform .18s}
@@ -649,8 +883,7 @@ function getStyle() {
 .text-danger{color:#b91c1c}
 .delete-btn{color:#dc2626;background:rgba(220,38,38,.1);width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .2s;margin-left:8px;border:none;flex-shrink:0}
 .delete-btn:hover{background:#dc2626;color:#fff}
-.progress-bar-container{height:4px;background:#e5e7eb;border-radius:2px;overflow:hidden;margin:20px 0}
-.progress-bar{height:100%;background:#2563eb;width:0;transition:width .35s ease}
+.progress-bar-container{display:none}
 .error{text-align:center;padding:16px;color:#991b1b;background:#fee2e2;border:1px solid #fecaca;border-radius:8px}
 
 @media (max-width: 700px){
@@ -666,7 +899,51 @@ function getStyle() {
   .status-bars{width:100%;margin-right:0;margin-bottom:8px}
   .status-bar{flex:1}
   .percentage-display{position:absolute;top:12px;right:42px;font-size:12px}
+  .delete-btn,.edit-btn{width:40px;height:40px}
   .delete-btn{position:absolute;top:8px;right:8px}
+  .edit-btn{position:absolute;top:8px;right:54px}
+}
+.loading-status{padding:20px;text-align:center;color:#6b7280;font-size:14px}
+.loading-text{display:flex;align-items:center;justify-content:center;gap:8px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:1000}
+.modal-box{background:#fff;border-radius:12px;padding:24px;width:90%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.15)}
+.modal-box h3{margin:0 0 16px;font-size:18px;color:#111827}
+.modal-box .form-row{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.modal-box input{padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;width:100%;box-sizing:border-box}
+.modal-box .btn-row{display:flex;gap:10px;justify-content:flex-end}
+.modal-box button{padding:9px 16px;border-radius:8px;border:none;font-weight:600;cursor:pointer}
+.modal-box .btn-save{background:#16a34a;color:#fff}
+.modal-box .btn-cancel{background:#6b7280;color:#fff}
+.dragging{opacity:.5}
+.sortable-ghost{opacity:.3}
+.sortable-chosen{box-shadow:0 8px 24px rgba(0,0,0,.15)}
+
+:root[data-theme=light]{--bg:#eef2f7;--card:#fff;--text:#1f2937;--text2:#6b7280;--border:#e5e7eb;--input-bg:#fff;--input-border:#d1d5db;--manage-border:#6b7280;--success:#16a34a;--danger:#dc2626}
+:root[data-theme=dark]{--bg:#0f172a;--card:#1e293b;--text:#f1f5f9;--text2:#94a3b8;--border:#334155;--input-bg:#0f172a;--input-border:#475569;--manage-border:#3b82f6;--success:#22c55e;--danger:#ef4444}
+[data-theme=dark] body{background:var(--bg);color:var(--text)}
+[data-theme=dark] .header{background:var(--card);box-shadow:0 6px 20px rgba(0,0,0,.3)}
+[data-theme=dark] .monitor-name{color:var(--text)}
+[data-theme=dark] .logout-link{color:var(--text2)}
+[data-theme=dark] .countdown{background:#1e293b;border-color:#334155;color:var(--text2)}
+[data-theme=dark] .manage-panel{background:var(--card);box-shadow:0 6px 20px rgba(0,0,0,.3)}
+[data-theme=dark] .manage-panel h3{color:var(--text)}
+[data-theme=dark] .add-form input{background:var(--input-bg);border-color:var(--input-border);color:var(--text)}
+[data-theme=dark] .status-item{background:var(--card)}
+[data-theme=dark] .status-item.status-up{border-left-color:var(--success)}
+[data-theme=dark] .status-item.status-down{border-left-color:var(--danger)}
+[data-theme=dark] .website-name{color:var(--text)}
+[data-theme=dark] .site-url{color:var(--text2)}
+[data-theme=dark] .status-summary{background:var(--card);border-color:var(--border);color:var(--text2)}
+[data-theme=dark] .status-indicator{background:var(--text2)}
+[data-theme=dark] .status-up .status-indicator{background:var(--success);box-shadow:0 0 10px rgba(34,197,94,.35)}
+[data-theme=dark] .status-down .status-indicator{background:var(--danger);box-shadow:0 0 10px rgba(239,68,68,.35)}
+[data-theme=dark] .modal-box{background:var(--card)}
+[data-theme=dark] .modal-box h3{color:var(--text)}
+[data-theme=dark] .modal-box input{background:var(--input-bg);border-color:var(--input-border);color:var(--text)}
+[data-theme=dark] .modal-overlay{background:rgba(0,0,0,.6)}
+[data-theme=dark] .error{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.3);color:#fca5a5}
+[data-theme=dark] .loading-status{color:var(--text2)}
+[data-theme=dark] .loading-text i{color:var(--text2)}
 }`;
 }
 
@@ -681,17 +958,19 @@ const addSiteBtn=document.getElementById("addSiteBtn");
 const refreshInterval=${refreshIntervalMs};
 let nextRefreshTime=Date.now()+refreshInterval;
 let isFetching=false;
+let isDarkMode=localStorage.getItem("darkMode")==="1";
+
+function applyDarkMode(){
+  document.documentElement.setAttribute("data-theme",isDarkMode?"dark":"light");
+}
+applyDarkMode();
 
 function showLoading(){
   statusList.innerHTML="";
   const container=document.createElement("div");
-  container.className="progress-bar-container";
-  const bar=document.createElement("div");
-  bar.className="progress-bar";
-  container.appendChild(bar);
+  container.className="loading-status";
+  container.innerHTML='<div class="loading-text"><i class="fas fa-spinner fa-spin"></i> 正在检测站点...</div>';
   statusList.appendChild(container);
-  setTimeout(()=>{bar.style.width="72%"},80);
-  setTimeout(()=>{bar.style.width="92%"},420);
 }
 
 async function parseResponse(res){
@@ -724,10 +1003,44 @@ async function logout(){
   }catch(e){
     // ignore
   }
-  document.cookie="auth_password=; Path=/; Max-Age=0";
   location.reload();
 }
 window.logout=logout;
+
+const darkModeBtn=document.getElementById("darkModeBtn");
+if(darkModeBtn){
+  darkModeBtn.addEventListener("click",()=>{
+    isDarkMode=!isDarkMode;
+    localStorage.setItem("darkMode",isDarkMode?"1":"0");
+    applyDarkMode();
+    darkModeBtn.innerHTML=isDarkMode?'<i class="fas fa-sun"></i>':'<i class="fas fa-moon"></i>';
+  });
+  darkModeBtn.innerHTML=isDarkMode?'<i class="fas fa-sun"></i>':'<i class="fas fa-moon"></i>';
+}
+
+const deleteAllBtn=document.getElementById("deleteAllBtn");
+if(deleteAllBtn){
+  deleteAllBtn.addEventListener("click",async ()=>{
+    const count=document.querySelectorAll(".status-item").length;
+    if(!count){alert("没有站点可删除");return;}
+    if(!confirm("确定要清空全部 "+count+" 个站点吗？此操作不可恢复！")) return;
+    if(!confirm("再次确认：删除全部站点？")) return;
+    try{
+      const sites=await api("/api/sites");
+      for(const site of (sites.sites||[])){
+        await api("/api/del-site",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({url:site.url})
+        });
+      }
+      await fetchStatus(true);
+      alert("已清空全部站点");
+    }catch(e){
+      alert(e.message||"删除失败");
+    }
+  });
+}
 
 if(manageBtn&&managePanel){
   manageBtn.addEventListener("click",()=>{
@@ -776,6 +1089,59 @@ async function deleteSite(url){
   }
 }
 
+let editModalVisible = false;
+function openEditModal(site){
+  if(editModalVisible) return;
+  editModalVisible=true;
+  const overlay=document.createElement("div");
+  overlay.className="modal-overlay";
+  overlay.innerHTML=\`
+  <div class="modal-box">
+    <h3><i class="fas fa-edit"></i> 编辑站点</h3>
+    <div class="form-row">
+      <input type="text" id="editSiteName2" placeholder="站点名称" value="\${(site.name||"").replace(/"/g,"&quot;")}">
+      <input type="text" id="editSiteUrl2" placeholder="站点 URL" value="\${(site.url||"").replace(/"/g,"&quot;")}">
+    </div>
+    <div class="btn-row">
+      <button class="btn-cancel" id="modalCancelBtn">取消</button>
+      <button class="btn-save" id="modalSaveBtn">保存</button>
+    </div>
+  </div>\`;
+  document.body.appendChild(overlay);
+  const nameInput=document.getElementById("editSiteName2");
+  const urlInput=document.getElementById("editSiteUrl2");
+  nameInput.focus();
+  nameInput.select();
+
+  const closeModal=()=>{
+    document.body.removeChild(overlay);
+    editModalVisible=false;
+  };
+
+  document.getElementById("modalCancelBtn").addEventListener("click",closeModal);
+  overlay.addEventListener("click",(e)=>{if(e.target===overlay) closeModal();});
+
+  document.getElementById("modalSaveBtn").addEventListener("click",async ()=>{
+    const name=nameInput.value.trim();
+    const newUrl=urlInput.value.trim();
+    if(!name){alert("请输入站点名称");return;}
+    if(!validateUrl(newUrl)){alert("请输入有效的 http/https URL");return;}
+    try{
+      await api("/api/edit-site",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({oldUrl:site.url,name,newUrl})
+      });
+      closeModal();
+      await fetchStatus(true);
+      alert("修改成功");
+    }catch(e){
+      alert(e.message||"修改失败");
+    }
+  });
+}
+window.openEditModal=openEditModal;
+
 function buildBars(history){
   const bars=document.createElement("div");
   bars.className="status-bars";
@@ -805,6 +1171,8 @@ function renderStatus(items){
   for(const site of list){
     const row=document.createElement("div");
     row.classList.add("status-item",site.isUp?"status-up":"status-down");
+    row.setAttribute("draggable","true");
+    row.dataset.url=site.url;
 
     const dot=document.createElement("div");
     dot.className="status-indicator";
@@ -845,14 +1213,68 @@ function renderStatus(items){
       deleteSite(site.url);
     });
 
+    const editBtn=document.createElement("button");
+    editBtn.type="button";
+    editBtn.className="edit-btn";
+    editBtn.title="编辑站点";
+    editBtn.innerHTML='<i class="fas fa-pen"></i>';
+    editBtn.addEventListener("click",(e)=>{
+      e.preventDefault();
+      e.stopPropagation();
+      openEditModal(site);
+    });
+
     row.appendChild(dot);
     row.appendChild(info);
     row.appendChild(access);
     row.appendChild(bars);
     row.appendChild(p);
+    row.appendChild(editBtn);
     row.appendChild(delBtn);
     statusList.appendChild(row);
   }
+
+  initDragDrop();
+}
+
+function initDragDrop(){
+  const rows=document.querySelectorAll(".status-item");
+  rows.forEach(row=>{
+    row.addEventListener("dragstart",(e)=>{
+      row.classList.add("dragging");
+      e.dataTransfer.setData("text/plain",row.dataset.url||"");
+    });
+    row.addEventListener("dragend",()=>{
+      document.querySelectorAll(".status-item").forEach(r=>r.classList.remove("dragging","sortable-ghost","sortable-chosen"));
+    });
+    row.addEventListener("dragover",(e)=>{
+      e.preventDefault();
+      const dragging=document.querySelector(".dragging");
+      if(!dragging||dragging===row) return;
+      const rect=row.getBoundingClientRect();
+      const midY=rect.top+rect.height/2;
+      document.querySelectorAll(".status-item").forEach(r=>r.classList.remove("sortable-ghost","sortable-chosen"));
+      if(e.clientY<midY){
+        row.classList.add("sortable-ghost");
+        row.parentNode.insertBefore(dragging,row);
+      }else{
+        row.classList.add("sortable-chosen");
+        row.parentNode.insertBefore(dragging,row.nextSibling);
+      }
+    });
+    row.addEventListener("drop",(e)=>{
+      e.preventDefault();
+      document.querySelectorAll(".status-item").forEach(r=>r.classList.remove("dragging","sortable-ghost","sortable-chosen"));
+      const newOrder=Array.from(document.querySelectorAll(".status-item")).map(r=>({url:r.dataset.url}));
+      if(newOrder.length>0){
+        api("/api/reorder-sites",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({sites:newOrder})
+        }).catch(()=>{});
+      }
+    });
+  });
 }
 
 async function fetchStatus(force){
