@@ -1095,18 +1095,18 @@ function openEditModal(site){
   editModalVisible=true;
   const overlay=document.createElement("div");
   overlay.className="modal-overlay";
-  overlay.innerHTML=`
+  overlay.innerHTML=\`
   <div class="modal-box">
     <h3><i class="fas fa-edit"></i> 编辑站点</h3>
     <div class="form-row">
-      <input type="text" id="editSiteName2" placeholder="站点名称" value="${(site.name||"").replace(/"/g,"&quot;")}">
-      <input type="text" id="editSiteUrl2" placeholder="站点 URL" value="${(site.url||"").replace(/"/g,"&quot;")}">
+      <input type="text" id="editSiteName2" placeholder="站点名称" value="\${(site.name||"").replace(/"/g,"&quot;")}">
+      <input type="text" id="editSiteUrl2" placeholder="站点 URL" value="\${(site.url||"").replace(/"/g,"&quot;")}">
     </div>
     <div class="btn-row">
       <button class="btn-cancel" id="modalCancelBtn">取消</button>
       <button class="btn-save" id="modalSaveBtn">保存</button>
     </div>
-  </div>`;
+  </div>\`;
   document.body.appendChild(overlay);
   const nameInput=document.getElementById("editSiteName2");
   const urlInput=document.getElementById("editSiteUrl2");
